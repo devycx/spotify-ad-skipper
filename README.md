@@ -2,7 +2,7 @@
 
 一个跑在 Spotify Web Player 上的油猴脚本。识别到广告后清空广告音源，广告结束自动恢复播放；单轮有硬上限、整个广告会话有收敛，不会无限重试把播放器拖死。
 
-- 安装（Greasy Fork）：https://greasyfork.org/zh-CN/scripts/XXXXXX
+- 安装（Greasy Fork）：https://greasyfork.org/zh-CN/scripts/603454
 - 直接装（GitHub）：https://raw.githubusercontent.com/devycx/spotify-ad-skipper/main/spotify-ad-skipper.user.js
 - 适用范围：`https://open.spotify.com/*`（桌面浏览器 + 支持油猴的移动浏览器）
 - 版本：3.3.0
