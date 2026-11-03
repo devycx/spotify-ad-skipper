@@ -2,9 +2,9 @@
 // @name         Spotify 网页版广告跳过（Hardened）
 // @name:en      Spotify Ad Skipper (Hardened)
 // @namespace    https://github.com/devycx/spotify-ad-skipper
-// @version      3.3.1
-// @description  跳过 Spotify 网页版广告：识别到广告后清空广告音源，广告结束自动恢复播放；单轮有硬上限、整个广告会话有收敛，不会无限重试把播放器打死
-// @description:en  Skip ads on the Spotify web player: clears the ad media source, then resumes playback. Hard-capped per ad and converged per ad session, so it never retries forever.
+// @version      3.4.0
+// @description  跳过 Spotify 网页版广告：识别到广告后清空广告音源，广告结束自动恢复播放；单轮有硬上限、整个广告会话有收敛；并带连接守护，后台/切网后播放器假死可自动恢复，必要时自动刷新
+// @description:en  Skip ads on the Spotify web player: clears the ad media source, then resumes playback. Hard-capped per ad and converged per ad session, so it never retries forever. Also detects a dead player connection after backgrounding/network switch and recovers (reload as a last resort).
 // @author       simonwep (original) / devycx (hardened)
 // @license      MIT
 // @homepageURL  https://github.com/devycx/spotify-ad-skipper
@@ -30,6 +30,16 @@
         playFallbackDelayMs: 500,      // 提升至 500ms，为慢加载设备的 activeEl.play() 提供安全缓冲
         maxClearsPerAd: 3,             // 整个广告会话周期最多清 src 3 次（跨轮次持久）
         maxTrackedElements: 6,         // 离屏媒体实例最大保留数
+
+        // ---- 连接守护：移动端后台/切网后 connect WebSocket 假死 ----
+        connGuard: true,
+        stallMs: 10000,                // 媒体在播但进度 10 秒不动
+        brokenConfirmMs: 5000,         // 疑似假死持续 5 秒才动手
+        backgroundCheckMs: 15000,      // 后台超过 15 秒，回前台才做检查
+        resumeCheckDelayMs: 5000,      // 回前台/重新联网后等 5 秒再看
+        recoverProbeMs: 7000,          // 轻量恢复后等 7 秒验收
+        autoReload: true,              // 仍假死且网络能通 → 自动刷新
+        reloadCooldownMs: 180000,      // 两次自动刷新至少间隔 3 分钟
         debug: false,
     };
 
@@ -127,6 +137,21 @@
     let bodyCheckTimer = null;
     let resumeTimer = null;
 
+    // 连接守护状态
+    let hiddenAt = 0;
+    let lastAdvanceAt = Date.now();
+    let lastMediaTime = -1;
+    let brokenSince = 0;
+    let lastRecoveryAt = 0;
+    let pendingRecoveryReason = '';
+    let connEventsBound = false;
+    let recoveryTimer = null;
+    let recoveryProbeTimer = null;
+    let reloadTimer = null;
+    let visualCheckTimer = null;
+    let toastEl = null;
+    let toastTimer = null;
+
     let skipActive = false;
     let skipStart = 0;
     let currentSkipTicks = 0;
@@ -177,6 +202,9 @@
             log('injectMediaHooks failed', e);
         }
     })();
+
+    // WebSocket 要在页面主包建连之前挂上，才能记到 Spotify connect 连接的断开
+    injectConnHooks();
 
     function hasMediaSource(el) {
         if (!el) return false;
@@ -238,6 +266,7 @@
         const onActivate = () => {
             if (el.isConnected) el.__everConnected = true;
             el.__lastActiveAt = Date.now();
+            lastAdvanceAt = Date.now(); // 新一次播放从这里重新计时
             if (hasMediaSource(el) || !el.paused) {
                 mediaElement = el;
             }
@@ -638,6 +667,353 @@
         }, CONFIG.resumeDelayMs);
     }
 
+    // ==================== 连接守护（移动端后台/切网假死） ====================
+    function injectConnHooks() {
+        try {
+            const WS = pageWindow.WebSocket;
+            if (!WS || WS.__adSkipperWsHookedV34) return;
+            const Wrapped = new Proxy(WS, {
+                construct(target, args) {
+                    const socket = Reflect.construct(target, args, target);
+                    trackSocket(socket);
+                    return socket;
+                },
+            });
+            try { Object.defineProperty(WS, '__adSkipperWsHookedV34', { value: true }); } catch (e) { /* ignore */ }
+            pageWindow.WebSocket = Wrapped;
+            log('websocket hook installed');
+        } catch (e) {
+            log('websocket hook failed', e);
+        }
+    }
+
+    function trackSocket(socket) {
+        try {
+            if (!socket || typeof socket.addEventListener !== 'function') return;
+            const url = String(socket.url || '');
+            if (!/^wss?:\/\//i.test(url)) return;
+            if (!/spotify|scdn|dealer|spclient|guc/i.test(url)) return;
+
+            socket.addEventListener('close', (ev) => {
+                if (ev && ev.wasClean) return;
+                log('spotify socket closed uncleanly:', url);
+                // 先给 Spotify 自己的重连逻辑 5 秒；没缓过来再介入
+                setTimeout(() => {
+                    if (document.visibilityState !== 'visible') {
+                        pendingRecoveryReason = 'ws-close';
+                        return;
+                    }
+                    if (computeBroken(Date.now())) scheduleRecovery('ws-close');
+                }, 5000);
+            }, { passive: true });
+        } catch (e) { /* ignore */ }
+    }
+
+    function readSession(key) {
+        try { return sessionStorage.getItem(key); } catch (e) { return null; }
+    }
+
+    function writeSession(key, value) {
+        try { sessionStorage.setItem(key, value); } catch (e) { /* ignore */ }
+    }
+
+    function toast(text, hold = 3500) {
+        if (!document.body) return;
+        if (!toastEl || !toastEl.isConnected) {
+            toastEl = document.createElement('div');
+            toastEl.style.cssText =
+                'position:fixed;left:50%;top:calc(env(safe-area-inset-top,0px) + 12px);transform:translateX(-50%);' +
+                'z-index:2147483647;max-width:86vw;padding:6px 12px;border-radius:999px;' +
+                'background:rgba(0,0,0,.82);color:#fff;font:12px/1.5 system-ui,sans-serif;' +
+                'text-align:center;pointer-events:none;transition:opacity .2s ease;opacity:1';
+            document.body.appendChild(toastEl);
+        }
+        toastEl.textContent = text;
+        toastEl.style.opacity = '1';
+        if (toastTimer) clearTimeout(toastTimer);
+        if (hold) {
+            toastTimer = setTimeout(() => {
+                toastTimer = null;
+                if (toastEl) toastEl.style.opacity = '0';
+            }, hold);
+        }
+    }
+
+    function trackPlaybackProgress(now) {
+        const el = getActiveMediaElement();
+        if (!el) {
+            lastMediaTime = -1;
+            lastAdvanceAt = now;
+            return;
+        }
+        if (!el.paused && !el.ended) {
+            if (el.currentTime !== lastMediaTime) {
+                lastMediaTime = el.currentTime;
+                lastAdvanceAt = now;
+            }
+        } else {
+            // 暂停时不重置 lastAdvanceAt，否则"假死"被 play() 叫醒后
+            // 会因为有进度而误判成功（见 recoverySucceeded）
+            lastMediaTime = el.currentTime;
+        }
+    }
+
+    function computeBroken(now = Date.now()) {
+        if (!CONFIG.connGuard || skipActive || adSessionGaveUp) return false;
+
+        const btn = getPlayButton();
+        const uiPlaying = btn ? buttonShowsPause(btn) : false;
+        const el = getActiveMediaElement();
+        const mediaPlaying = Boolean(el && !el.paused && !el.ended);
+
+        // UI 和媒体都说"没在播"，就当作是用户自己暂停的
+        if (!uiPlaying && !mediaPlaying) return false;
+        if (!el || el.ended) return false;
+
+        // UI 认为在播、媒体却停了：移动端回前台后最常见的一种假死
+        if (el.paused) return uiPlaying;
+
+        return now - lastAdvanceAt >= CONFIG.stallMs;
+    }
+
+    function resetConnGuard() {
+        brokenSince = 0;
+        pendingRecoveryReason = '';
+        lastAdvanceAt = Date.now();
+    }
+
+    function scheduleRecovery(reason) {
+        if (!CONFIG.connGuard || recoveryTimer || recoveryProbeTimer || reloadTimer) return;
+        if (skipActive || adSessionGaveUp) return;
+        if (document.visibilityState !== 'visible') {
+            pendingRecoveryReason = reason;
+            return;
+        }
+
+        const now = Date.now();
+        if (now - lastRecoveryAt < 15000) return;
+        lastRecoveryAt = now;
+
+        log('connection recovery scheduled:', reason);
+        toast('播放连接卡住了，正在尝试恢复…', 4000);
+        recoveryTimer = setTimeout(() => {
+            recoveryTimer = null;
+            runRecovery(reason);
+        }, 300);
+    }
+
+    function runRecovery(reason) {
+        if (skipActive || adSessionGaveUp) return;
+        log('recovering:', reason);
+
+        // 给页面补一个 online 事件，Spotify 自己的网络状态监听会借此重连
+        try { pageWindow.dispatchEvent(new pageWindow.Event('online')); } catch (e) { /* ignore */ }
+
+        // 媒体层再推一把（广告期间不动）
+        const el = getActiveMediaElement();
+        if (el && el.paused && !el.ended) {
+            try { el.play().catch(() => {}); } catch (e) { /* ignore */ }
+        }
+
+        recoveryProbeTimer = setTimeout(() => {
+            recoveryProbeTimer = null;
+            if (document.visibilityState !== 'visible') {
+                pendingRecoveryReason = reason;
+                return;
+            }
+            if (recoverySucceeded(reason)) {
+                toast('连接已恢复', 2500);
+                resetConnGuard();
+                return;
+            }
+            if (navigator.onLine === false) {
+                toast('网络已断开，等待联网后自动恢复…', 5000);
+                pendingRecoveryReason = reason;
+                lastRecoveryAt = Date.now() + 40000; // 断网期间别每 15 秒弹一次
+                return;
+            }
+            probeServer().then((reachable) => {
+                if (recoverySucceeded(reason)) {
+                    toast('连接已恢复', 2500);
+                    resetConnGuard();
+                    return;
+                }
+                if (!reachable) {
+                    toast('网络似乎还没恢复，稍后自动重试…', 5000);
+                    pendingRecoveryReason = reason;
+                    lastRecoveryAt = Date.now() + 40000;
+                    return;
+                }
+                maybeReload(reason);
+            });
+        }, CONFIG.recoverProbeMs);
+    }
+
+    function recoverySucceeded(reason) {
+        const now = Date.now();
+        const el = getActiveMediaElement();
+        const mediaPlaying = Boolean(el && !el.paused && !el.ended);
+
+        // 用户点播放没反应触发的恢复：必须真的开始播了才算成功
+        if (reason === 'play-click-no-effect') {
+            return mediaPlaying && now - lastAdvanceAt < CONFIG.stallMs;
+        }
+        return !computeBroken(now);
+    }
+
+    function probeServer(timeoutMs = 4000) {
+        return new Promise((resolve) => {
+            let img;
+            try {
+                img = new Image();
+            } catch (e) {
+                resolve(true); // 拿不到 Image 就不拦自动刷新
+                return;
+            }
+            let done = false;
+            const finish = (ok) => {
+                if (done) return;
+                done = true;
+                clearTimeout(timer);
+                img.onload = null;
+                img.onerror = null;
+                resolve(ok);
+            };
+            const timer = setTimeout(() => finish(false), timeoutMs);
+            img.onload = () => finish(true);
+            img.onerror = () => finish(false);
+            img.src = '/favicon.ico?connect_probe=' + Date.now();
+        });
+    }
+
+    function maybeReload(reason) {
+        if (!CONFIG.autoReload) return;
+
+        const last = Number(readSession('__adSkipperReloadAt')) || 0;
+        if (last && Date.now() - last < CONFIG.reloadCooldownMs) {
+            log('auto reload suppressed by cooldown');
+            toast('连接仍未恢复，可手动刷新页面', 4000);
+            lastRecoveryAt = Date.now() + 40000;
+            resetConnGuard();
+            return;
+        }
+
+        writeSession('__adSkipperReloadAt', String(Date.now()));
+        writeSession('__adSkipperWasPlaying', '1');
+        log('auto reload:', reason);
+        toast('连接卡死，正在自动刷新…', 0);
+
+        if (reloadTimer) clearTimeout(reloadTimer);
+        reloadTimer = setTimeout(() => {
+            reloadTimer = null;
+            try { location.reload(); } catch (e) { /* ignore */ }
+        }, 800);
+    }
+
+    // 自动刷新后，等播放器初始化完再点一次播放（能否出声取决于浏览器自动播放策略）
+    function maybeResumeAfterReload() {
+        if (readSession('__adSkipperWasPlaying') !== '1') return;
+        try { sessionStorage.removeItem('__adSkipperWasPlaying'); } catch (e) { /* ignore */ }
+
+        toast('已自动刷新，正在恢复播放…', 5000);
+        setTimeout(() => {
+            try {
+                const btn = getPlayButton();
+                if (btn && buttonShowsPlay(btn)) {
+                    btn.click();
+                    log('post-reload play click sent');
+                }
+            } catch (e) { /* ignore */ }
+
+            setTimeout(() => {
+                const el = getActiveMediaElement();
+                if (!el || el.ended || !el.paused) return;
+                try {
+                    el.play().catch(() => toast('已刷新，点一下播放继续', 5000));
+                } catch (e) {
+                    toast('已刷新，点一下播放继续', 5000);
+                }
+            }, 1500);
+        }, 2500);
+    }
+
+    function connWatchdogTick(now) {
+        trackPlaybackProgress(now);
+
+        const broken = computeBroken(now);
+        if (!broken) {
+            brokenSince = 0;
+            return;
+        }
+        if (!brokenSince) brokenSince = now;
+
+        if (document.visibilityState !== 'visible') {
+            pendingRecoveryReason = 'broken-in-background';
+            return;
+        }
+        if (now - brokenSince >= CONFIG.brokenConfirmMs) {
+            scheduleRecovery('playback-broken');
+        }
+    }
+
+    function initConnGuard() {
+        if (connEventsBound || !CONFIG.connGuard) return;
+        connEventsBound = true;
+
+        document.addEventListener('visibilitychange', () => {
+            if (document.visibilityState === 'hidden') {
+                hiddenAt = Date.now();
+                return;
+            }
+            const away = hiddenAt ? Date.now() - hiddenAt : 0;
+            hiddenAt = 0;
+            if (away < CONFIG.backgroundCheckMs) return;
+
+            if (visualCheckTimer) clearTimeout(visualCheckTimer);
+            visualCheckTimer = setTimeout(() => {
+                visualCheckTimer = null;
+                if (document.visibilityState !== 'visible' || skipActive) return;
+                if (computeBroken(Date.now())) {
+                    scheduleRecovery('resume-after-background');
+                } else if (pendingRecoveryReason) {
+                    const reason = pendingRecoveryReason;
+                    pendingRecoveryReason = '';
+                    scheduleRecovery(reason);
+                } else {
+                    resetConnGuard();
+                }
+            }, CONFIG.resumeCheckDelayMs);
+        });
+
+        window.addEventListener('online', () => {
+            if (document.visibilityState !== 'visible') {
+                pendingRecoveryReason = 'online';
+                return;
+            }
+            setTimeout(() => {
+                if (computeBroken(Date.now())) scheduleRecovery('online');
+            }, CONFIG.resumeCheckDelayMs);
+        }, { passive: true });
+
+        // 点击"播放"后 7 秒还没开始播 → 播放器大概率已经假死
+        document.addEventListener('click', (e) => {
+            const target = e.target;
+            if (!target || !target.closest) return;
+            const btn = target.closest('[data-testid="control-button-playpause"]');
+            if (!btn || !buttonShowsPlay(btn)) return;
+            setTimeout(() => {
+                if (document.visibilityState !== 'visible' || skipActive) return;
+                const el = getActiveMediaElement();
+                const currentBtn = getPlayButton();
+                const stillNotPlaying = (!el || el.paused || el.ended) &&
+                    (!currentBtn || buttonShowsPlay(currentBtn));
+                if (stillNotPlaying) scheduleRecovery('play-click-no-effect');
+            }, 7000);
+        }, true);
+
+        log('connection guard bound');
+    }
+
     // ==================== 主流程与 SPA 守护 ====================
     async function main() {
         try {
@@ -645,10 +1021,14 @@
             await queryAsync(() => getPlayButton(), CONFIG.barTimeoutMs);
             startObserver(bar);
             startWatchdog();
+            initConnGuard();
+            maybeResumeAfterReload();
             log('main ready');
         } catch (e) {
             log('main failed:', e.message);
             startWatchdog();
+            initConnGuard();
+            maybeResumeAfterReload();
         }
     }
 
@@ -689,7 +1069,9 @@
     function startWatchdog() {
         if (watchdogInterval) return;
         watchdogInterval = setInterval(() => {
+            const now = Date.now();
             pruneTrackedElements();
+            if (CONFIG.connGuard) connWatchdogTick(now);
 
             if ((adSessionGaveUp || adSessionClears > 0) && !skipActive && !isAdPlayingStrong()) {
                 const link = getNowPlayingLink();
@@ -718,6 +1100,11 @@
         if (skipDebounce) clearTimeout(skipDebounce);
         if (bodyCheckTimer) clearTimeout(bodyCheckTimer);
         if (resumeTimer) clearTimeout(resumeTimer);
+        if (recoveryTimer) clearTimeout(recoveryTimer);
+        if (recoveryProbeTimer) clearTimeout(recoveryProbeTimer);
+        if (reloadTimer) clearTimeout(reloadTimer);
+        if (visualCheckTimer) clearTimeout(visualCheckTimer);
+        if (toastTimer) clearTimeout(toastTimer);
         for (const el of Array.from(trackedElements)) {
             cleanupMediaElement(el);
         }

@@ -5,7 +5,7 @@
 - 安装（Greasy Fork）：https://greasyfork.org/zh-CN/scripts/603454
 - 直接装（GitHub）：https://raw.githubusercontent.com/devycx/spotify-ad-skipper/main/spotify-ad-skipper.user.js
 - 适用范围：`https://open.spotify.com/*`（桌面浏览器 + 支持油猴的移动浏览器）
-- 版本：3.3.1
+- 版本：3.4.0
 
 ## 它做什么
 
@@ -32,6 +32,33 @@
 | `adSessionGaveUp` | — | 超限后只静音，不再动媒体节点 |
 
 `adSessionGaveUp` 置位后不会再自动重试，直到确认切到正常内容路由（`/track`、`/album`、`/playlist`、`/search` 等）才重置会话。
+
+## 连接守护（v3.4 新增）
+
+移动端把标签页放后台、切 Wi-Fi/5G、或者代理换节点之后，Spotify 的 connect WebSocket 经常"假死"：界面还在，播放停了，点播放没反应，只能整页刷新。v3.4 在 watchdog 里加了三个判断：
+
+1. `<audio>` 在播，但 `currentTime` 连续 10 秒不动；
+2. 底栏显示"暂停"，但媒体元素已经 `paused` 超过 5 秒；
+3. 你点了播放按钮，7 秒后仍然没开始播。
+
+命中任一条 → 先给页面补一个 `online` 事件、调一次 `activeEl.play()`；7 秒后仍未恢复，且用同源 favicon 探测到网络是通的，就自动刷新页面（3 分钟内最多一次），刷新后尝试自动点播放。整个过程会在页面顶部显示提示，不会静默刷新。
+
+WebSocket 钩子会记录 Spotify connect 连接的非正常关闭，作为辅助信号；它不会重建连接，真正兜底的仍是"刷新"。
+
+**脚本管不到的情况**：Quetta / 小米系统直接把标签页冻结或杀掉时，脚本根本没有执行机会。要让后台播放稳定，仍需要：
+
+- Quetta：关闭后台标签页冻结/自动清理，长按 Spotify 标签锁定；广告拦截把 `spotify.com`、`scdn.co`、`spotifycdn.com`、`apresolve.spotify.com`、`spclient.wg.spotify.com` 加白名单。
+- 小米：设置 → 应用设置 → 应用管理 → Quetta → 省电策略 → **无限制**，允许后台活动/自启动；最近任务里锁定 Quetta；测试时关掉系统省电模式。
+- 代理/VPN：播放时不要切节点；确保 Spotify 的 HTTPS 和 WSS 走同一条线路。
+- 开发者选项里的"暂停执行已缓存的应用 / 不保留活动"要关掉。
+
+不想自动刷新的话，把文件顶部 `CONFIG.autoReload` 改成 `false`，其余检测和轻量恢复仍会生效。
+
+## 常见问题：能把"爱心"放到锁屏媒体卡片上吗
+
+不能。网页能控制的只有 Media Session API，它的动作是固定枚举（`play`、`pause`、`previoustrack`、`nexttrack`、`seekto`…），没有 `like`，也不支持自定义按钮；Android 的媒体卡片由系统按这个枚举渲染，网页无法往里加图标。脚本能做的只有在页面里加一个悬浮爱心按钮，锁屏上做不到。
+
+想从锁屏收藏，只能走原生客户端，或者用 Tasker/MacroDroid + Spotify Web API 另做一个独立通知（需要 OAuth、还要同步当前曲目，成本很高）。
 
 ## 已知边界
 
