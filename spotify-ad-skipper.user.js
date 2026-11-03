@@ -2,13 +2,15 @@
 // @name         Spotify 网页版广告跳过（Hardened）
 // @name:en      Spotify Ad Skipper (Hardened)
 // @namespace    https://github.com/devycx/spotify-ad-skipper
-// @version      3.4.0
+// @version      3.4.1
 // @description  跳过 Spotify 网页版广告：识别到广告后清空广告音源，广告结束自动恢复播放；单轮有硬上限、整个广告会话有收敛；并带连接守护，后台/切网后播放器假死可自动恢复，必要时自动刷新
 // @description:en  Skip ads on the Spotify web player: clears the ad media source, then resumes playback. Hard-capped per ad and converged per ad session, so it never retries forever. Also detects a dead player connection after backgrounding/network switch and recovers (reload as a last resort).
 // @author       simonwep (original) / devycx (hardened)
 // @license      MIT
 // @homepageURL  https://github.com/devycx/spotify-ad-skipper
 // @supportURL   https://github.com/devycx/spotify-ad-skipper/issues
+// @updateURL    https://raw.githubusercontent.com/devycx/spotify-ad-skipper/main/spotify-ad-skipper.user.js
+// @downloadURL  https://raw.githubusercontent.com/devycx/spotify-ad-skipper/main/spotify-ad-skipper.user.js
 // @icon         https://raw.githubusercontent.com/devycx/spotify-ad-skipper/main/icon.png
 // @match        https://open.spotify.com/*
 // @grant        unsafeWindow

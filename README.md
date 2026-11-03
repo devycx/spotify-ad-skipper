@@ -5,7 +5,7 @@
 - 安装（Greasy Fork）：https://greasyfork.org/zh-CN/scripts/603454
 - 直接装（GitHub）：https://raw.githubusercontent.com/devycx/spotify-ad-skipper/main/spotify-ad-skipper.user.js
 - 适用范围：`https://open.spotify.com/*`（桌面浏览器 + 支持油猴的移动浏览器）
-- 版本：3.4.0
+- 版本：3.4.1
 
 ## 它做什么
 
