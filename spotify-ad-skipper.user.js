@@ -4,9 +4,9 @@
 // @name:zh-CN   Spotify 网页版广告跳过（自动恢复播放）
 // @namespace    https://github.com/devycx/spotify-ad-skipper
 // @version      3.5.0
-// @description  Automatically skip audio ads on the Spotify web player and resume your music. Detects ads without relying on duration, caps retries so playback never gets stuck, and recovers a frozen player after backgrounding or network changes.
-// @description:en  Automatically skip audio ads on the Spotify web player and resume your music. Detects ads without relying on duration, caps retries so playback never gets stuck, and recovers a frozen player after backgrounding or network changes.
-// @description:zh-CN  自动跳过 Spotify 网页版音频广告，广告结束后恢复播放；不依赖时长判定，限制重试次数避免卡死，并在后台/切网导致播放器假死时自动恢复。
+// @description  Lightweight Spotify audio ad blocker for the web player: skips ads automatically and resumes your music. Detects ads without relying on duration, caps retries so playback never gets stuck, and recovers a frozen player after backgrounding or network changes.
+// @description:en  Lightweight Spotify audio ad blocker for the web player: skips ads automatically and resumes your music. Detects ads without relying on duration, caps retries so playback never gets stuck, and recovers a frozen player after backgrounding or network changes.
+// @description:zh-CN  轻量级 Spotify 网页版音频广告拦截：自动跳过广告并恢复播放；不依赖时长判定，限制重试次数避免卡死，并在后台/切网导致播放器假死时自动恢复。
 // @author       simonwep (original) / devycx (hardened)
 // @license      MIT
 // @homepageURL  https://github.com/devycx/spotify-ad-skipper

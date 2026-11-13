@@ -1,6 +1,6 @@
 # Spotify Ad Skipper
 
-A userscript for the **Spotify Web Player** that detects audio ads, cuts their media source, and resumes your music when the ad ends. Every ad and every ad session is capped, so it never retries forever and drags the player down.
+A lightweight **audio ad blocker for the Spotify Web Player**: it detects ads, cuts their media source, and resumes your music when the ad ends. Every ad and every ad session is capped, so it never retries forever and drags the player down.
 
 **English** | [简体中文](README.zh-CN.md)
 
