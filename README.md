@@ -7,7 +7,7 @@ A lightweight **audio ad blocker for the Spotify Web Player**: it detects ads, c
 - Install (Greasy Fork): https://greasyfork.org/en/scripts/603454
 - Direct install (GitHub): https://raw.githubusercontent.com/devycx/spotify-ad-skipper/main/spotify-ad-skipper.user.js
 - Works on: `https://open.spotify.com/*` (desktop browsers and mobile browsers with userscript support)
-- Version: 3.5.0
+- Version: 3.5.1
 
 ## What it does
 
