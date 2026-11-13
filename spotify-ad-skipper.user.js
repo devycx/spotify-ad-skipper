@@ -1,10 +1,12 @@
 // ==UserScript==
-// @name         Spotify 网页版广告跳过（Hardened）
-// @name:en      Spotify Ad Skipper (Hardened)
+// @name         Spotify Ad Skipper - Auto-Skip Ads & Resume on Web Player
+// @name:en      Spotify Ad Skipper - Auto-Skip Ads & Resume on Web Player
+// @name:zh-CN   Spotify 网页版广告跳过（自动恢复播放）
 // @namespace    https://github.com/devycx/spotify-ad-skipper
-// @version      3.4.1
-// @description  跳过 Spotify 网页版广告：识别到广告后清空广告音源，广告结束自动恢复播放；单轮有硬上限、整个广告会话有收敛；并带连接守护，后台/切网后播放器假死可自动恢复，必要时自动刷新
-// @description:en  Skip ads on the Spotify web player: clears the ad media source, then resumes playback. Hard-capped per ad and converged per ad session, so it never retries forever. Also detects a dead player connection after backgrounding/network switch and recovers (reload as a last resort).
+// @version      3.5.0
+// @description  Automatically skip audio ads on the Spotify web player and resume your music. Detects ads without relying on duration, caps retries so playback never gets stuck, and recovers a frozen player after backgrounding or network changes.
+// @description:en  Automatically skip audio ads on the Spotify web player and resume your music. Detects ads without relying on duration, caps retries so playback never gets stuck, and recovers a frozen player after backgrounding or network changes.
+// @description:zh-CN  自动跳过 Spotify 网页版音频广告，广告结束后恢复播放；不依赖时长判定，限制重试次数避免卡死，并在后台/切网导致播放器假死时自动恢复。
 // @author       simonwep (original) / devycx (hardened)
 // @license      MIT
 // @homepageURL  https://github.com/devycx/spotify-ad-skipper
@@ -23,27 +25,69 @@
     const CONFIG = {
         barTimeoutMs: 15000,
         skipCheckIntervalMs: 300,
-        watchdogIntervalMs: 1000,      // 1s 巡检底栏重绘与僵尸节点
-        maxSkipTicks: 60,              // 单轮硬上限：约 18 秒
+        watchdogIntervalMs: 1000,      // 1s watchdog for bar re-renders and zombie nodes
+        maxSkipTicks: 60,              // hard cap per skip cycle: ~18s
         maxSkipDurationMs: 35000,
-        adEndConfirmTicks: 2,          // 连续 2 次确认广告结束
-        emptyHrefGraceTicks: 5,        // 清除 src 后允许链接短暂为空的过渡周期（约 1.5 秒）
-        resumeDelayMs: 800,            // 恢复前等待 Spotify 状态机稳定
-        playFallbackDelayMs: 500,      // 提升至 500ms，为慢加载设备的 activeEl.play() 提供安全缓冲
-        maxClearsPerAd: 3,             // 整个广告会话周期最多清 src 3 次（跨轮次持久）
-        maxTrackedElements: 6,         // 离屏媒体实例最大保留数
+        adEndConfirmTicks: 2,          // require 2 consecutive confirmations that the ad ended
+        emptyHrefGraceTicks: 5,        // after clearing src, allow a short window where the link is empty (~1.5s)
+        resumeDelayMs: 800,            // wait for Spotify's state machine to settle before resuming
+        playFallbackDelayMs: 500,      // 500ms gives slow devices a safety buffer for activeEl.play()
+        maxClearsPerAd: 3,             // at most 3 src clears per ad session (persists across skip cycles)
+        maxTrackedElements: 6,         // max off-screen media elements to keep
 
-        // ---- 连接守护：移动端后台/切网后 connect WebSocket 假死 ----
+        // ---- Connection guard: Spotify connect WebSocket stalls after backgrounding / network switches ----
         connGuard: true,
-        stallMs: 10000,                // 媒体在播但进度 10 秒不动
-        brokenConfirmMs: 5000,         // 疑似假死持续 5 秒才动手
-        backgroundCheckMs: 15000,      // 后台超过 15 秒，回前台才做检查
-        resumeCheckDelayMs: 5000,      // 回前台/重新联网后等 5 秒再看
-        recoverProbeMs: 7000,          // 轻量恢复后等 7 秒验收
-        autoReload: true,              // 仍假死且网络能通 → 自动刷新
-        reloadCooldownMs: 180000,      // 两次自动刷新至少间隔 3 分钟
+        stallMs: 10000,                // media is playing but currentTime has not moved for 10s
+        brokenConfirmMs: 5000,         // act only after a suspected stall lasts 5s
+        backgroundCheckMs: 15000,      // only check after being backgrounded for 15s+
+        resumeCheckDelayMs: 5000,      // wait 5s after returning to foreground / reconnecting
+        recoverProbeMs: 7000,          // wait 7s to verify a lightweight recovery
+        autoReload: true,              // still stalled but network is reachable -> auto reload
+        reloadCooldownMs: 180000,      // at least 3 minutes between auto reloads
+
+        // UI language: 'auto' follows the browser, or force 'en' / 'zh-CN'
+        locale: 'auto',
         debug: false,
     };
+
+    const MESSAGES = {
+        en: {
+            recovering: 'Playback connection stalled. Trying to recover…',
+            restored: 'Connection restored',
+            offline: 'Network offline. Will retry when the connection returns…',
+            networkPending: 'Network still unavailable. Will retry shortly…',
+            reloadSuppressed: 'Connection still down. You can reload the page manually.',
+            reloading: 'Player connection is stuck. Reloading automatically…',
+            reloadedResuming: 'Page reloaded. Resuming playback…',
+            reloadedManual: 'Page reloaded. Press play to continue.',
+        },
+        'zh-CN': {
+            recovering: '播放连接卡住了，正在尝试恢复…',
+            restored: '连接已恢复',
+            offline: '网络已断开，等待联网后自动恢复…',
+            networkPending: '网络似乎还没恢复，稍后自动重试…',
+            reloadSuppressed: '连接仍未恢复，可手动刷新页面',
+            reloading: '连接卡死，正在自动刷新…',
+            reloadedResuming: '已自动刷新，正在恢复播放…',
+            reloadedManual: '已刷新，点一下播放继续',
+        },
+    };
+
+    function detectLocale() {
+        if (CONFIG.locale && CONFIG.locale !== 'auto') return CONFIG.locale;
+        const languages = Array.isArray(navigator.languages) && navigator.languages.length
+            ? navigator.languages
+            : [navigator.language || 'en'];
+        for (const language of languages) {
+            const normalized = String(language).toLowerCase();
+            if (normalized === 'zh' || normalized.startsWith('zh-')) return 'zh-CN';
+            if (normalized === 'en' || normalized.startsWith('en-')) return 'en';
+        }
+        return 'en';
+    }
+
+    const UI_LOCALE = detectLocale();
+    const t = (key) => (MESSAGES[UI_LOCALE] && MESSAGES[UI_LOCALE][key]) || MESSAGES.en[key] || key;
 
     const BAR_SELECTORS = [
         '[data-testid="now-playing-bar"]',
@@ -52,15 +96,16 @@
     ].join(',');
 
     const AD_HREF_RE = /^\/(ad|ads|sponsored)\b/i;
-    // 补全常见正常内容页路由，确保切回正片时能可靠触发会话重置
+    // Common normal-content routes so returning to real content reliably resets the ad session
     const NORMAL_CONTENT_HREF_RE = /^\/(track|episode|album|playlist|artist|show|mix|radio|search|collection|user|concert)\b/i;
+    // Chinese labels are kept because Spotify localizes its UI
     const AD_TEXT_RE = /^(advertisement|sponsored|spotify\s*ad|广告|廣告)$/i;
 
-    // 英文保留 \b 防止匹配 playlist/player；中文去尾锚以兼容“播放音乐”、“暂停播放”等组合词
+    // \b keeps English from matching playlist/player; Chinese has no trailing anchor so compounds like 播放音乐/暂停播放 still match
     const PLAY_LABEL_RE = /^(?:(play|resume)\b|播放)/i;
     const PAUSE_LABEL_RE = /^(?:pause\b|暂停|暫停)/i;
 
-    // 严格校验播放/暂停按钮，绝不误触 Shuffle / Previous / Next / Repeat
+    // Strictly validate play/pause buttons; never hit Shuffle / Previous / Next / Repeat
     const PLAY_BUTTON_FNS = [
         (root) => root.querySelector('[data-testid="control-button-playpause"]'),
         (root) => {
@@ -127,7 +172,7 @@
         });
     }
 
-    // ==================== 状态 ====================
+    // ==================== State ====================
     const trackedElements = new Set();
     let mediaElement = null;
     let playButton = null;
@@ -139,7 +184,7 @@
     let bodyCheckTimer = null;
     let resumeTimer = null;
 
-    // 连接守护状态
+    // connection guard state
     let hiddenAt = 0;
     let lastAdvanceAt = Date.now();
     let lastMediaTime = -1;
@@ -161,11 +206,11 @@
     let wePausedIt = false;
     let lastClearedSrc = '';
 
-    // 跨 skip 周期持久化的广告会话状态
+    // ad session state persisted across skip cycles
     let adSessionClears = 0;
     let adSessionGaveUp = false;
 
-    // ==================== 媒体节点生命周期与拦截 ====================
+    // ==================== Media element lifecycle & hooks ====================
     (function injectMediaHooks() {
         try {
             const Doc = pageWindow.Document;
@@ -205,7 +250,7 @@
         }
     })();
 
-    // WebSocket 要在页面主包建连之前挂上，才能记到 Spotify connect 连接的断开
+    // Hook WebSocket before the page opens its connection so Spotify connect closes are observable
     injectConnHooks();
 
     function hasMediaSource(el) {
@@ -268,7 +313,7 @@
         const onActivate = () => {
             if (el.isConnected) el.__everConnected = true;
             el.__lastActiveAt = Date.now();
-            lastAdvanceAt = Date.now(); // 新一次播放从这里重新计时
+            lastAdvanceAt = Date.now(); // reset stall timer when playback starts again
             if (hasMediaSource(el) || !el.paused) {
                 mediaElement = el;
             }
@@ -376,7 +421,7 @@
         return mediaElement;
     }
 
-    // ==================== 播放按钮与状态判定 ====================
+    // ==================== Play button & state detection ====================
     function getPlayButton() {
         const root = getBarRoot();
         const btn = queryFirstFn(PLAY_BUTTON_FNS, root) || (root !== document ? queryFirstFn(PLAY_BUTTON_FNS, document) : null);
@@ -405,7 +450,7 @@
         return isPlay && !isPause;
     }
 
-    // ==================== 广告检测 ====================
+    // ==================== Ad detection ====================
     function getNowPlayingLink() {
         const root = getBarRoot();
         return queryFirstFn([
@@ -455,7 +500,7 @@
         return false;
     }
 
-    // ==================== 跳过广告 ====================
+    // ==================== Ad skipping ====================
     function scheduleSkip() {
         if (skipDebounce || skipActive) return;
 
@@ -653,7 +698,7 @@
             Promise.resolve()
                 .then(() => activeEl.play())
                 .then(() => {
-                    // 即使流慢加载导致 resolve 时 paused 仍为 true，也安全清理定时器，依靠 fallback 兜底
+                    // even if slow loading leaves paused=true when play() resolves, clean up the timer and rely on the fallback
                     clearTimeout(fallbackTimer);
                     fallbackDone = true;
                     if (!activeEl.paused) {
@@ -669,7 +714,7 @@
         }, CONFIG.resumeDelayMs);
     }
 
-    // ==================== 连接守护（移动端后台/切网假死） ====================
+    // ==================== Connection guard (mobile background / network stall) ====================
     function injectConnHooks() {
         try {
             const WS = pageWindow.WebSocket;
@@ -699,7 +744,7 @@
             socket.addEventListener('close', (ev) => {
                 if (ev && ev.wasClean) return;
                 log('spotify socket closed uncleanly:', url);
-                // 先给 Spotify 自己的重连逻辑 5 秒；没缓过来再介入
+                // give Spotify's own reconnect logic 5s before stepping in
                 setTimeout(() => {
                     if (document.visibilityState !== 'visible') {
                         pendingRecoveryReason = 'ws-close';
@@ -754,8 +799,8 @@
                 lastAdvanceAt = now;
             }
         } else {
-            // 暂停时不重置 lastAdvanceAt，否则"假死"被 play() 叫醒后
-            // 会因为有进度而误判成功（见 recoverySucceeded）
+            // do not reset lastAdvanceAt while paused; otherwise a stalled player
+            // woken by play() would look recovered just because currentTime moved (see recoverySucceeded)
             lastMediaTime = el.currentTime;
         }
     }
@@ -768,11 +813,11 @@
         const el = getActiveMediaElement();
         const mediaPlaying = Boolean(el && !el.paused && !el.ended);
 
-        // UI 和媒体都说"没在播"，就当作是用户自己暂停的
+        // UI and media both say "not playing": treat it as a user pause
         if (!uiPlaying && !mediaPlaying) return false;
         if (!el || el.ended) return false;
 
-        // UI 认为在播、媒体却停了：移动端回前台后最常见的一种假死
+        // UI says playing but media stopped: the most common stall after returning to foreground
         if (el.paused) return uiPlaying;
 
         return now - lastAdvanceAt >= CONFIG.stallMs;
@@ -797,7 +842,7 @@
         lastRecoveryAt = now;
 
         log('connection recovery scheduled:', reason);
-        toast('播放连接卡住了，正在尝试恢复…', 4000);
+        toast(t('recovering'), 4000);
         recoveryTimer = setTimeout(() => {
             recoveryTimer = null;
             runRecovery(reason);
@@ -808,10 +853,10 @@
         if (skipActive || adSessionGaveUp) return;
         log('recovering:', reason);
 
-        // 给页面补一个 online 事件，Spotify 自己的网络状态监听会借此重连
+        // dispatch an online event so Spotify's own network listener reconnects
         try { pageWindow.dispatchEvent(new pageWindow.Event('online')); } catch (e) { /* ignore */ }
 
-        // 媒体层再推一把（广告期间不动）
+        // nudge the media layer too (not during ads)
         const el = getActiveMediaElement();
         if (el && el.paused && !el.ended) {
             try { el.play().catch(() => {}); } catch (e) { /* ignore */ }
@@ -824,24 +869,24 @@
                 return;
             }
             if (recoverySucceeded(reason)) {
-                toast('连接已恢复', 2500);
+                toast(t('restored'), 2500);
                 resetConnGuard();
                 return;
             }
             if (navigator.onLine === false) {
-                toast('网络已断开，等待联网后自动恢复…', 5000);
+                toast(t('offline'), 5000);
                 pendingRecoveryReason = reason;
-                lastRecoveryAt = Date.now() + 40000; // 断网期间别每 15 秒弹一次
+                lastRecoveryAt = Date.now() + 40000; // avoid a toast every 15s while offline
                 return;
             }
             probeServer().then((reachable) => {
                 if (recoverySucceeded(reason)) {
-                    toast('连接已恢复', 2500);
+                    toast(t('restored'), 2500);
                     resetConnGuard();
                     return;
                 }
                 if (!reachable) {
-                    toast('网络似乎还没恢复，稍后自动重试…', 5000);
+                    toast(t('networkPending'), 5000);
                     pendingRecoveryReason = reason;
                     lastRecoveryAt = Date.now() + 40000;
                     return;
@@ -856,7 +901,7 @@
         const el = getActiveMediaElement();
         const mediaPlaying = Boolean(el && !el.paused && !el.ended);
 
-        // 用户点播放没反应触发的恢复：必须真的开始播了才算成功
+        // recovery triggered by a play click that did nothing: only success once playback actually starts
         if (reason === 'play-click-no-effect') {
             return mediaPlaying && now - lastAdvanceAt < CONFIG.stallMs;
         }
@@ -869,7 +914,7 @@
             try {
                 img = new Image();
             } catch (e) {
-                resolve(true); // 拿不到 Image 就不拦自动刷新
+                resolve(true); // if Image is unavailable, do not block auto reload
                 return;
             }
             let done = false;
@@ -894,7 +939,7 @@
         const last = Number(readSession('__adSkipperReloadAt')) || 0;
         if (last && Date.now() - last < CONFIG.reloadCooldownMs) {
             log('auto reload suppressed by cooldown');
-            toast('连接仍未恢复，可手动刷新页面', 4000);
+            toast(t('reloadSuppressed'), 4000);
             lastRecoveryAt = Date.now() + 40000;
             resetConnGuard();
             return;
@@ -903,7 +948,7 @@
         writeSession('__adSkipperReloadAt', String(Date.now()));
         writeSession('__adSkipperWasPlaying', '1');
         log('auto reload:', reason);
-        toast('连接卡死，正在自动刷新…', 0);
+        toast(t('reloading'), 0);
 
         if (reloadTimer) clearTimeout(reloadTimer);
         reloadTimer = setTimeout(() => {
@@ -912,12 +957,12 @@
         }, 800);
     }
 
-    // 自动刷新后，等播放器初始化完再点一次播放（能否出声取决于浏览器自动播放策略）
+    // after an auto reload, wait for the player to initialize then click play (audibility depends on autoplay policy)
     function maybeResumeAfterReload() {
         if (readSession('__adSkipperWasPlaying') !== '1') return;
         try { sessionStorage.removeItem('__adSkipperWasPlaying'); } catch (e) { /* ignore */ }
 
-        toast('已自动刷新，正在恢复播放…', 5000);
+        toast(t('reloadedResuming'), 5000);
         setTimeout(() => {
             try {
                 const btn = getPlayButton();
@@ -931,9 +976,9 @@
                 const el = getActiveMediaElement();
                 if (!el || el.ended || !el.paused) return;
                 try {
-                    el.play().catch(() => toast('已刷新，点一下播放继续', 5000));
+                    el.play().catch(() => toast(t('reloadedManual'), 5000));
                 } catch (e) {
-                    toast('已刷新，点一下播放继续', 5000);
+                    toast(t('reloadedManual'), 5000);
                 }
             }, 1500);
         }, 2500);
@@ -997,7 +1042,7 @@
             }, CONFIG.resumeCheckDelayMs);
         }, { passive: true });
 
-        // 点击"播放"后 7 秒还没开始播 → 播放器大概率已经假死
+        // 7s after a Play click with no playback -> the player is probably stalled
         document.addEventListener('click', (e) => {
             const target = e.target;
             if (!target || !target.closest) return;
@@ -1016,7 +1061,7 @@
         log('connection guard bound');
     }
 
-    // ==================== 主流程与 SPA 守护 ====================
+    // ==================== Main flow & SPA guard ====================
     async function main() {
         try {
             const bar = await queryAsync(BAR_SELECTORS, CONFIG.barTimeoutMs);
@@ -1046,7 +1091,7 @@
                 if (isAdPlayingStrong()) {
                     if (!skipActive) scheduleSkip();
                 } else {
-                    // 【已修正】：严格移除了 adSessionGaveUp 短路，只认准切到了正常内容路由且强信号彻底消失时才重置
+                    // fixed: removed the adSessionGaveUp shortcut; reset only when the route is normal content and the strong ad signal is gone
                     const link = getNowPlayingLink();
                     const href = link ? (link.getAttribute('href') || '') : '';
                     if (!skipActive && NORMAL_CONTENT_HREF_RE.test(href)) {
@@ -1078,7 +1123,7 @@
             if ((adSessionGaveUp || adSessionClears > 0) && !skipActive && !isAdPlayingStrong()) {
                 const link = getNowPlayingLink();
                 const href = link ? (link.getAttribute('href') || '') : '';
-                // 空 href 只是底栏重绘的过渡态，不能当作"广告结束"，否则计数会被提前清零
+                // an empty href is just a transient bar re-render, not "ad ended"; otherwise counters reset too early
                 if (NORMAL_CONTENT_HREF_RE.test(href)) {
                     resetAdSession();
                 }
@@ -1094,7 +1139,7 @@
         }, CONFIG.watchdogIntervalMs);
     }
 
-    // ==================== 清理 ====================
+    // ==================== Cleanup ====================
     window.addEventListener('beforeunload', () => {
         stopSkipInterval();
         if (watchdogInterval) clearInterval(watchdogInterval);
@@ -1112,7 +1157,7 @@
         }
     });
 
-    // ==================== 启动 ====================
+    // ==================== Start ====================
     if (document.readyState === 'loading') {
         document.addEventListener('DOMContentLoaded', main, { once: true });
     } else {

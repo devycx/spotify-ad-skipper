@@ -1,73 +1,80 @@
-# Spotify 网页版广告跳过（Hardened）
+# Spotify Ad Skipper
 
-一个跑在 Spotify Web Player 上的油猴脚本。识别到广告后清空广告音源，广告结束自动恢复播放；单轮有硬上限、单条广告有收敛，不会无限重试把播放器拖死。
+A userscript for the **Spotify Web Player** that detects audio ads, cuts their media source, and resumes your music when the ad ends. Every ad and every ad session is capped, so it never retries forever and drags the player down.
 
-- 安装（Greasy Fork）：https://greasyfork.org/zh-CN/scripts/603454
-- 直接装（GitHub）：https://raw.githubusercontent.com/devycx/spotify-ad-skipper/main/spotify-ad-skipper.user.js
-- 适用范围：`https://open.spotify.com/*`（桌面浏览器 + 支持油猴的移动浏览器）
-- 版本：3.4.1
+**English** | [简体中文](README.zh-CN.md)
 
-## 它做什么
+- Install (Greasy Fork): https://greasyfork.org/en/scripts/603454
+- Direct install (GitHub): https://raw.githubusercontent.com/devycx/spotify-ad-skipper/main/spotify-ad-skipper.user.js
+- Works on: `https://open.spotify.com/*` (desktop browsers and mobile browsers with userscript support)
+- Version: 3.5.0
 
-1. 用 `document.createElement` 钩子登记所有 `<audio>` / `<video>`，再用 `HTMLMediaElement.prototype.play` 钩子记录"当前真正在播的那个"——Spotify 换曲、换广告都会新建或复用媒体节点。
-2. 通过底栏的 `data-testid`、`aria-label`、链接 `href`（`/ad`、`/ads`、`/sponsored`）判断广告，**不靠时长**，所以不会把短歌误判成广告。
-3. 命中广告就 `pause()` + `removeAttribute('src')` + `load()`，让广告流直接断掉。
-4. 广告结束后等 800ms，优先点播放按钮恢复；点不动就调 `activeEl.play()`；还不行再兜底点一次"非暂停态"的按钮。三步都失败就停下，不循环点。
-5. `MutationObserver` 盯底栏重绘，1 秒一次的 watchdog 兜底：底栏被 SPA 换掉会重新绑定，僵尸媒体节点会清理。
+## What it does
 
-## 为什么是"清 src"而不是拖进度条
+1. Hooks `document.createElement` to register every `<audio>` / `<video>`, then hooks `HTMLMediaElement.prototype.play` to track the element that is actually playing. Spotify creates or reuses media elements whenever it switches tracks or ads.
+2. Detects ads from the now-playing bar using `data-testid`, `aria-label`, and link `href` (`/ad`, `/ads`, `/sponsored`). It does **not** use duration, so a short song is not mistaken for an ad.
+3. On a hit, it calls `pause()` + `removeAttribute('src')` + `load()`, which cuts the ad stream.
+4. After the ad, it waits 800 ms and tries to resume in three steps: click the Play button, call `activeEl.play()`, then click the button once more if it is not in a paused state. It stops after all three fail instead of clicking in a loop.
+5. A `MutationObserver` watches the bar, and a 1-second watchdog catches the rest: the observer is re-bound when the SPA replaces the bar, and zombie media elements are cleaned up.
+6. A connection guard detects a frozen player after backgrounding or a network switch, then tries a lightweight recovery before falling back to a reload (see below).
 
-另一种写法是把广告 `currentTime` 拖到 `duration`，等于让它瞬间播完。问题是这要求媒体已经拿到 metadata——`readyState` 太低时给 `currentTime` 赋值会抛 `InvalidStateError`；而且拖完之后播放器仍停在广告上下文里，要等它自己切下一首。
+## Why clear `src` instead of seeking
 
-这一版改成 `removeAttribute('src')` + `load()`：媒体元素直接失去数据源，播放器只能走"广告结束"分支。代价是页面状态会短暂错乱（按钮变灰、进度条归零），所以广告结束后有 800ms 的稳定等待和三级恢复兜底。
+The other common approach is to set the ad's `currentTime` to its `duration`, which makes it finish instantly. That requires the media to have metadata: assigning `currentTime` while `readyState` is too low throws `InvalidStateError`. Even after seeking, the player stays in the ad context and waits for Spotify to switch tracks.
 
-## 收敛（v3 的重点）
+This version uses `removeAttribute('src')` + `load()` instead: the media element loses its source, so the player has to take the "ad ended" branch. The tradeoff is a brief inconsistent UI (greyed-out controls, progress reset), which is why there is an 800 ms settle delay and a three-stage resume fallback.
 
-早期版本最危险的不是"跳不过广告"，是**跳不过还一直试**：每次轮询都清一次 src，播放器被反复打断，最后整页卡死。现在有三层限制：
+## Convergence (the point of v3)
 
-| 限制 | 值 | 作用 |
+The dangerous failure mode in early versions was not "the ad was not skipped" but **"the ad was not skipped and the script kept trying"**: every poll cleared `src` again, the player was interrupted repeatedly, and the whole page eventually froze. There are now three limits:
+
+| Limit | Value | Purpose |
 | --- | --- | --- |
-| `maxSkipTicks` / `maxSkipDurationMs` | 60 次 / 35s | 单轮跳过到点就收手 |
-| `maxClearsPerAd` | 3 | 同一条广告最多清 3 次 src |
-| `adSessionGaveUp` | — | 超限后只静音，不再动媒体节点 |
+| `maxSkipTicks` / `maxSkipDurationMs` | 60 ticks / 35s | Stop a single skip cycle at the cap |
+| `maxClearsPerAd` | 3 | Clear `src` at most 3 times for the same ad |
+| `adSessionGaveUp` | — | After the cap, only mute; never touch the media element again |
 
-`adSessionGaveUp` 置位后不会再自动重试，直到确认切到正常内容路由（`/track`、`/album`、`/playlist`、`/search` 等）才重置会话。
+Once `adSessionGaveUp` is set, the script does not retry automatically. It resets only after it confirms a normal content route (`/track`, `/album`, `/playlist`, `/search`, etc.).
 
-## 连接守护（v3.4 新增）
+## Connection guard (v3.4)
 
-移动端把标签页放后台、切 Wi-Fi/5G、或者代理换节点之后，Spotify 的 connect WebSocket 经常"假死"：界面还在，播放停了，点播放没反应，只能整页刷新。v3.4 在 watchdog 里加了三个判断：
+After you background the tab, switch Wi-Fi/5G, or change proxy nodes on mobile, Spotify's connect WebSocket often stalls: the UI is still there, playback stops, and pressing Play does nothing. A full page reload used to be the only fix. v3.4 adds three checks to the watchdog:
 
-1. `<audio>` 在播，但 `currentTime` 连续 10 秒不动；
-2. 底栏显示"暂停"，但媒体元素已经 `paused` 超过 5 秒；
-3. 你点了播放按钮，7 秒后仍然没开始播。
+1. `<audio>` is playing, but `currentTime` has not moved for 10 seconds.
+2. The bar shows "Pause", but the media element has been `paused` for more than 5 seconds.
+3. You click Play, and playback still has not started after 7 seconds.
 
-命中任一条 → 先给页面补一个 `online` 事件、调一次 `activeEl.play()`；7 秒后仍未恢复，且用同源 favicon 探测到网络是通的，就自动刷新页面（3 分钟内最多一次），刷新后尝试自动点播放。整个过程会在页面顶部显示提示，不会静默刷新。
+If any check matches, the script first dispatches an `online` event and calls `activeEl.play()` once. If playback is still broken after 7 seconds and a same-origin favicon probe shows the network is reachable, it reloads the page automatically (at most once every 3 minutes), then tries to click Play after the reload. A toast at the top of the page explains what is happening; it never reloads silently.
 
-WebSocket 钩子会记录 Spotify connect 连接的非正常关闭，作为辅助信号；它不会重建连接，真正兜底的仍是"刷新"。
+The WebSocket hook records unclean closes of the Spotify connect socket as a secondary signal. It does not rebuild the connection; the real last resort is still the reload.
 
-**脚本管不到的情况**：Quetta / 小米系统直接把标签页冻结或杀掉时，脚本根本没有执行机会。要让后台播放稳定，仍需要：
+**What the script cannot handle:** if Quetta or Xiaomi freezes or kills the tab, the script never gets a chance to run. For reliable background playback you still need:
 
-- Quetta：关闭后台标签页冻结/自动清理，长按 Spotify 标签锁定；广告拦截把 `spotify.com`、`scdn.co`、`spotifycdn.com`、`apresolve.spotify.com`、`spclient.wg.spotify.com` 加白名单。
-- 小米：设置 → 应用设置 → 应用管理 → Quetta → 省电策略 → **无限制**，允许后台活动/自启动；最近任务里锁定 Quetta；测试时关掉系统省电模式。
-- 代理/VPN：播放时不要切节点；确保 Spotify 的 HTTPS 和 WSS 走同一条线路。
-- 开发者选项里的"暂停执行已缓存的应用 / 不保留活动"要关掉。
+- Quetta: disable background tab freezing/auto-cleanup, lock the Spotify tab, and whitelist `spotify.com`, `scdn.co`, `spotifycdn.com`, `apresolve.spotify.com`, and `spclient.wg.spotify.com` in your ad blocker.
+- Xiaomi: Settings → Apps → Manage apps → Quetta → Battery saver → **No restrictions**, allow background activity/autostart, lock Quetta in Recents, and disable system battery saver while testing.
+- Proxy/VPN: do not switch nodes during playback; make sure Spotify's HTTPS and WSS traffic use the same route.
+- Turn off "Pause cached apps" / "Don't keep activities" in Developer options.
 
-不想自动刷新的话，把文件顶部 `CONFIG.autoReload` 改成 `false`，其余检测和轻量恢复仍会生效。
+To disable automatic reloads, set `CONFIG.autoReload` to `false` at the top of the file. The detection and lightweight recovery still work.
 
-## 常见问题：能把"爱心"放到锁屏媒体卡片上吗
+## FAQ: can the heart button appear on the lock-screen media card?
 
-不能。网页能控制的只有 Media Session API，它的动作是固定枚举（`play`、`pause`、`previoustrack`、`nexttrack`、`seekto`…），没有 `like`，也不支持自定义按钮；Android 的媒体卡片由系统按这个枚举渲染，网页无法往里加图标。脚本能做的只有在页面里加一个悬浮爱心按钮，锁屏上做不到。
+No. A web page can only control the Media Session API, whose actions are a fixed enum (`play`, `pause`, `previoustrack`, `nexttrack`, `seekto`, …). There is no `like` action and no way to add custom buttons; Android renders the media card from that enum, so a web page cannot add an icon to it. The most a userscript can do is add a floating heart button in the page, not on the lock screen.
 
-想从锁屏收藏，只能走原生客户端，或者用 Tasker/MacroDroid + Spotify Web API 另做一个独立通知（需要 OAuth、还要同步当前曲目，成本很高）。
+To like a track from the lock screen, use the native client, or build a separate notification with Tasker/MacroDroid + the Spotify Web API (which needs OAuth and current-track sync, so it is considerably more work).
 
-## 已知边界
+## Known limits
 
-- **UI 改版会失效**：广告判定依赖 `data-testid` 和 `aria-label`，Spotify 换标记就要跟着改。
-- **广告类型**：只处理媒体元素里的音频广告。页面级插屏、视频广告、以及服务端直接切流（不换 `src`）的情况不覆盖。
-- **不是去广告会员**：跳过的是"这次播放"，不是"以后不再投放"。
-- **可能误伤**：如果某首正片异常短、且底栏链接是 `/ad` 开头，会被当成广告。实际没见过，但逻辑上存在。
-- **违反 Spotify 服务条款**：这只是本地 DOM/媒体 API 操作，不修改服务端数据，但用不用自己判断。
+- **UI changes break detection**: ad detection depends on `data-testid` and `aria-label`; if Spotify changes those markers, the script needs an update.
+- **Ad types**: it only handles audio ads inside media elements. Page-level interstitials, video ads, and server-side stream switches that do not change `src` are not covered.
+- **Not an ad-free membership**: it skips *this playback*, not *future ad delivery*.
+- **Possible false positive**: if a real track is unusually short and the bar link starts with `/ad`, it can be treated as an ad. This has not been observed in practice, but the logic allows it.
+- **Spotify Terms of Service**: this is local DOM/media API manipulation and does not modify server data, but whether to use it is your call.
 
-## 原始版本与许可
+## UI language
 
-初版来自 [simonwep 的 gist](https://gist.github.com/simonwep/24f8cdcd6d32d86e929004013bd660ae)，这一版在它基础上重写了检测、恢复与收敛逻辑。MIT License，见 [LICENSE](LICENSE)。
+The script follows the browser language. English is the default; Simplified Chinese is included. To force a language, set `CONFIG.locale` to `'en'` or `'zh-CN'` at the top of the file.
+
+## Original version and license
+
+The first version came from [simonwep's gist](https://gist.github.com/simonwep/24f8cdcd6d32d86e929004013bd660ae). This version rewrites the detection, recovery, and convergence logic on top of it. MIT License, see [LICENSE](LICENSE).
